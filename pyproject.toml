@@ -1,0 +1,56 @@
+[project]
+name = "pkmn-factors"
+version = "0.0.1"
+description = "Real-time factor scoring for Pokémon TCG PSA slabs"
+readme = "README.md"
+requires-python = ">=3.11"
+
+# Runtime dependencies your app needs to run
+dependencies = [
+  "fastapi",
+  "uvicorn[standard]",
+  "pydantic",
+  "pydantic-settings",
+  "httpx",
+  "pandas",
+  "numpy",
+  "python-dotenv",
+  "loguru",
+  "tenacity",
+  "beautifulsoup4",
+  "lxml",
+  "sqlalchemy",
+  "asyncpg",
+  "alembic",
+]
+
+# Dev-only tools (formatting, linting, tests)
+[project.optional-dependencies]
+dev = [
+  "ruff",
+  "black",
+  "mypy",
+  "pytest",
+  "pytest-cov",
+  "pre-commit",
+  "types-requests",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Tell packaging where your code lives (we’ll use a 'src' layout)
+[tool.hatch.build.targets.wheel]
+packages = ["src/pkmn_factors"]
+
+[dependency-groups]
+dev = [
+    "black>=25.1.0",
+    "mypy>=1.17.1",
+    "pre-commit>=4.3.0",
+    "pytest>=8.4.1",
+    "pytest-cov>=6.2.1",
+    "ruff>=0.12.10",
+    "types-requests>=2.32.4.20250809",
+]
