@@ -3,64 +3,32 @@ from __future__ import annotations
 import asyncio
 from typing import Sequence
 
-import sqlalchemy as sa
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
 
-from pkmn_factors.config import settings
-
-
-def create_engine(
-    url: str | None = None, echo: bool = False, pool_pre_ping: bool = True
-) -> AsyncEngine:
-    return create_async_engine(
-        url or settings.DATABASE_URL, echo=echo, pool_pre_ping=pool_pre_ping
-    )
+from pkmn_factors.db.base import get_engine
 
 
-async def _exec_many(engine: AsyncEngine, stmts: Sequence[sa.sql.Executable]) -> None:
+async def _refresh_views(engine: AsyncEngine, views: Sequence[str]) -> None:
     async with engine.begin() as conn:
-        for s in stmts:
-            await conn.execute(s)
+        for v in views:
+            await conn.execute(text(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {v};"))
 
 
-async def refresh_trades_daily() -> None:
-    engine = create_engine()
-    await _exec_many(
-        engine, [sa.text("REFRESH MATERIALIZED VIEW CONCURRENTLY trades_daily")]
-    )
+async def run(refresh_mv: bool = False) -> None:
+    engine = get_engine()
+    if refresh_mv:
+        await _refresh_views(engine, ["cards_signals_trades_daily_mv"])
 
 
-async def seed_cards() -> None:
-    engine = create_engine()
-    stmt = sa.text(
-        """
-        INSERT INTO cards (card_key, name, set_code, rarity)
-        VALUES (:card_key, :name, :set_code, :rarity)
-        ON CONFLICT (card_key) DO NOTHING
-        """
-    )
-    params = [
-        {
-            "card_key": "mew-ex-053-svp-2023",
-            "name": "Mew ex #053",
-            "set_code": "SVP",
-            "rarity": "Promo",
-        },
-    ]
-    async with engine.begin() as conn:
-        for p in params:
-            await conn.execute(stmt, p)
-
-
-if __name__ == "__main__":
+def main() -> None:
     import argparse
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--seed-demo", action="store_true")
     ap.add_argument("--refresh-mv", action="store_true")
     args = ap.parse_args()
+    asyncio.run(run(refresh_mv=args.refresh_mv))
 
-    if args.seed_demo:
-        asyncio.run(seed_cards())
-    if args.refresh_mv:
-        asyncio.run(refresh_trades_daily())
+
+if __name__ == "__main__":
+    main()

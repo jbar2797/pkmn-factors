@@ -1,33 +1,32 @@
-# src/pkmn_factors/config.py
 from __future__ import annotations
 
-from functools import lru_cache
-from pydantic_settings import BaseSettings, SettingsConfigDict
+import os
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings
 
 
-class Settings(BaseSettings):
-    # General
-    ENV: str = "dev"
-    LOG_LEVEL: str = "INFO"
-
-    # Database (async SQLAlchemy URL for Postgres/Timescale via asyncpg)
-    # If you run docker-compose from this repo, localhost:5432 is correct.
-    DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/pkmn"
-
-    # Pydantic Settings config: load from .env if present
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        case_sensitive=False,
-        extra="ignore",
+class _Settings(BaseSettings):
+    # read from env at runtime; default "" keeps mypy happy
+    DATABASE_URL: str = Field(
+        default_factory=lambda: os.getenv("DATABASE_URL", ""),
+        alias="DATABASE_URL",
     )
 
+    @property
+    def database_url(self) -> str:
+        # fail loudly at runtime if the variable is missing
+        if not self.DATABASE_URL:
+            raise ValueError(
+                "DATABASE_URL is not set. Example: "
+                "postgresql+asyncpg://postgres:postgres@localhost/pkmn"
+            )
+        return self.DATABASE_URL
 
-@lru_cache(maxsize=1)
-def get_settings() -> Settings:
-    """Singleton Settings instance (cached)."""
-    return Settings()
+
+# single, importable settings object
+settings: _Settings = _Settings()
 
 
-# Convenient module-level instance
-settings = get_settings()
+class AppInfo(BaseModel):
+    name: str = "pkmn-factors"
+    version: str = "0.0.1"
