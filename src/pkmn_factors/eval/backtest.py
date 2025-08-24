@@ -1,28 +1,29 @@
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Optional, cast
+from typing import Any, Dict, Optional, Tuple, cast
 
-import numpy as np
 import pandas as pd
-import sqlalchemy as sa
-from pandas import Series
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
-from pkmn_factors.config import settings
+# settings.database_url is provided by your project config
+from pkmn_factors.config import settings  # type: ignore[attr-defined]
 
 
-# --------------------------------------------------------------------------------------
-# Data structures
-# --------------------------------------------------------------------------------------
+# --------------------------- Data classes ---------------------------
 
 
 @dataclass(frozen=True)
-class BacktestResult:
+class Backtest:
     period_start: datetime
     period_end: datetime
     n_trades: int
@@ -35,165 +36,143 @@ class BacktestResult:
     max_drawdown: float
 
 
-# --------------------------------------------------------------------------------------
-# DB helpers
-# --------------------------------------------------------------------------------------
+# --------------------------- Helpers ---------------------------
 
 
-def _engine() -> AsyncEngine:
-    # Some stubs don’t know about this attribute; cast keeps mypy happy.
-    db_url = cast(str, getattr(settings, "database_url"))
-    return create_async_engine(db_url, pool_pre_ping=True, future=True)
+def _to_float_series(s: pd.Series) -> pd.Series:
+    """Ensure float dtype even if inputs are Decimal/strings/ints."""
+    return pd.to_numeric(s, errors="coerce").astype(float)
 
 
-# --------------------------------------------------------------------------------------
-# Loading
-# --------------------------------------------------------------------------------------
+def _ensure_utc_index(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """Return a UTC tz-aware DatetimeIndex."""
+    if idx.tz is None:
+        return idx.tz_localize("UTC")
+    return cast(pd.DatetimeIndex, idx.tz_convert("UTC"))
 
 
-async def _load_prices(engine: AsyncEngine, card_key: str) -> pd.DataFrame:
+def _positions_from_signals(
+    signals: pd.DataFrame, daily_index: pd.DatetimeIndex
+) -> pd.Series:
     """
-    Return raw trades for the card as a DataFrame with columns:
-      timestamp (tz-aware), price (float)
+    Map actions to positions and forward-fill onto the daily price index.
+    BUY -> +1, SELL -> -1, HOLD/other -> 0
     """
-    sql = sa.text(
+    if signals.empty:
+        return pd.Series(0.0, index=daily_index)
+
+    s = signals.copy()
+    s["asof_ts"] = pd.to_datetime(s["asof_ts"], utc=True)
+
+    action_map: Dict[str, float] = {"BUY": 1.0, "SELL": -1.0, "HOLD": 0.0}
+    s["pos"] = s["action"].map(action_map).fillna(0.0).astype(float)
+
+    ser = pd.Series(s["pos"].values, index=pd.DatetimeIndex(s["asof_ts"], tz="UTC"))
+    pos = ser.reindex(daily_index).ffill().fillna(0.0)
+    return pos.astype(float)
+
+
+def _max_drawdown_from_returns(ret: pd.Series) -> float:
+    """Compute max drawdown magnitude (positive number) from a returns series."""
+    if ret.empty:
+        return float("nan")
+    eq_curve = cast(pd.Series, (1.0 + ret.fillna(0.0)).cumprod()).astype(float)
+    peak = cast(pd.Series, eq_curve.cummax()).astype(float)
+    dd = (eq_curve / peak) - 1.0
+    return float(abs(dd.min())) if dd.size else float("nan")
+
+
+def _print_report(
+    card_key: str, model_version: str, horizon_days: int, bt: Backtest
+) -> None:
+    print("\n=== Backtest Report ===")
+    print(f"Card:          {card_key}")
+    print(f"Model version: {model_version}")
+    print(f"Horizon days:  {horizon_days}")
+    print(f"Period:        {bt.period_start} -> {bt.period_end}")
+    print(f"Trades:        {bt.n_trades}")
+    print(f"Signals:       {bt.n_signals}")
+    print(f"Win rate:      {bt.win_rate}")
+    print(f"Avg return:    {bt.avg_return:.6f}")
+    print(f"Cum return:    {bt.cum_return:.4f}")
+    print(f"Volatility:    {bt.volatility:.4f}")
+    print(f"Sharpe:        {bt.sharpe}")
+    print(f"Max drawdown:  {bt.max_drawdown:.4f}")
+    print("=======================\n")
+
+
+# --------------------------- DB access ---------------------------
+
+
+async def _load_prices_for_card(session: AsyncSession, card_key: str) -> pd.DataFrame:
+    """
+    Load raw trade prices for a card. Expected columns: timestamp (timestamptz), price (numeric).
+    """
+    q = text(
         """
-        SELECT asof_ts AS timestamp, price
+        SELECT timestamp, price
         FROM trades
         WHERE card_key = :card_key
-        ORDER BY asof_ts ASC
+        ORDER BY timestamp
         """
     )
-    async with engine.begin() as conn:
-        rows = (await conn.execute(sql, {"card_key": card_key})).mappings().all()
+    res = await session.execute(q, {"card_key": card_key})
+    rows = res.fetchall()
     if not rows:
         return pd.DataFrame(columns=["timestamp", "price"])
-
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows, columns=["timestamp", "price"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    # enforce float (handles Decimal)
-    df["price"] = pd.to_numeric(df["price"], errors="coerce").astype(float)
-    df = df.dropna(subset=["timestamp", "price"])
+    df["price"] = _to_float_series(df["price"])
     return df
 
 
-async def _load_signals(
-    engine: AsyncEngine, card_key: str, model_version: str
+async def _load_signals_for_card(
+    session: AsyncSession, card_key: str, model_version: str, horizon_days: int
 ) -> pd.DataFrame:
     """
-    Return signals (asof_ts, action) for the given card/model_version, sorted ASC.
-    action is expected in {'BUY','SELL','HOLD'}.
+    Load signals for a card. Expected columns: asof_ts (timestamptz), action (text).
     """
-    sql = sa.text(
+    q = text(
         """
         SELECT asof_ts, action
         FROM signals
         WHERE card_key = :card_key
           AND model_version = :model_version
-        ORDER BY asof_ts ASC
+          AND horizon_days = :horizon_days
+        ORDER BY asof_ts
         """
     )
-    async with engine.begin() as conn:
-        rows = (
-            (
-                await conn.execute(
-                    sql, {"card_key": card_key, "model_version": model_version}
-                )
-            )
-            .mappings()
-            .all()
-        )
-
+    res = await session.execute(
+        q,
+        {
+            "card_key": card_key,
+            "model_version": model_version,
+            "horizon_days": horizon_days,
+        },
+    )
+    rows = res.fetchall()
     if not rows:
         return pd.DataFrame(columns=["asof_ts", "action"])
-
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows, columns=["asof_ts", "action"])
     df["asof_ts"] = pd.to_datetime(df["asof_ts"], utc=True)
-    df["action"] = df["action"].astype(str)
     return df
 
 
-# --------------------------------------------------------------------------------------
-# Backtest core
-# --------------------------------------------------------------------------------------
+# --------------------------- Core backtest ---------------------------
 
 
-def _daily_last_series(df: pd.DataFrame) -> Series:
+def _bt(prices: pd.DataFrame, signals: pd.DataFrame) -> Tuple[Backtest, Dict[str, Any]]:
     """
-    From raw trades (timestamp, price), produce a daily last-observed price series.
+    Very simple daily long/flat/-short backtest driven by signals.
+    Returns (Backtest, extra_params_dict).
     """
-    if df.empty:
-        return pd.Series(dtype=float)
-    d = df.copy()
-    d["timestamp"] = pd.to_datetime(d["timestamp"], utc=True)
-    d["price"] = pd.to_numeric(d["price"], errors="coerce").astype(float)
-    daily = d.resample("1D", on="timestamp")["price"].last().dropna()
-
-    # Ensure a DatetimeIndex (UTC) for downstream ops and type-checkers
-    idx = pd.DatetimeIndex(daily.index)
-    if idx.tz is None:
-        idx = idx.tz_localize(timezone.utc)
-    daily.index = idx
-
-    return daily.astype(float)
-
-
-def _positions_from_signals(index: pd.DatetimeIndex, signals: pd.DataFrame) -> Series:
-    """
-    Create a position series (1 = long, -1 = short, 0 = flat) aligned to `index`.
-    Positions jump at/after each signal time.
-    """
-    pos = pd.Series(index=index, dtype=float, data=0.0)
-    if signals.empty:
-        return pos
-
-    def _act_to_pos(action: str) -> float:
-        a = action.upper()
-        if a == "BUY":
-            return 1.0
-        if a == "SELL":
-            return -1.0
-        return 0.0
-
-    for row in signals.itertuples(index=False):
-        ts = pd.to_datetime(getattr(row, "asof_ts"), utc=True)  # type: ignore[arg-type]
-        # searchsorted can return scalar or array depending on stubs; normalize to int
-        loc_raw = pos.index.searchsorted(ts)  # type: ignore[no-untyped-call]
-        if isinstance(loc_raw, (list, np.ndarray)):
-            loc = int(loc_raw[0]) if len(loc_raw) else 0
-        else:
-            loc = int(loc_raw)
-        if loc < len(pos.index):
-            pos.iloc[loc:] = _act_to_pos(str(getattr(row, "action")))
-    return pos
-
-
-def _max_drawdown_from_returns(ret: Series) -> float:
-    """
-    Compute max drawdown magnitude (positive number) from strategy returns.
-    """
-    if ret.empty:
-        return float("nan")
-    eq_curve: pd.Series = (1.0 + ret.fillna(0.0)).cumprod()
-    peak: pd.Series = eq_curve.cummax()
-    rel: pd.Series = cast(pd.Series, eq_curve / peak)
-    dd_ser: pd.Series = rel - 1.0
-    dd_min = float(dd_ser.min())
-    return float(abs(dd_min))
-
-
-def _bt(prices: Series, signals: pd.DataFrame) -> BacktestResult:
-    """
-    Naive daily strategy:
-      - positions determined by last known signal (BUY=+1, SELL=-1, HOLD=0)
-      - strategy return = position_{t-1} * daily_return
-    """
-    prices = pd.to_numeric(prices, errors="coerce").astype(float).dropna()
-    if prices.empty:
-        now = datetime.now(timezone.utc)
-        return BacktestResult(
-            period_start=now,
-            period_end=now,
+    # Daily close price series
+    daily = prices.resample("1D", on="timestamp")["price"].last().dropna()
+    if daily.empty:
+        now_utc = datetime.now(timezone.utc)
+        empty = Backtest(
+            period_start=now_utc,
+            period_end=now_utc,
             n_trades=0,
             n_signals=0,
             win_rate=float("nan"),
@@ -203,50 +182,44 @@ def _bt(prices: Series, signals: pd.DataFrame) -> BacktestResult:
             sharpe=float("nan"),
             max_drawdown=0.0,
         )
+        return empty, {"counts": {"prices_days": 0}}
 
-    daily_ret = prices.pct_change().fillna(0.0)
+    # Ensure UTC index
+    daily_idx = _ensure_utc_index(pd.DatetimeIndex(daily.index))
+    daily_ret = daily.pct_change().fillna(0.0).astype(float)
 
-    # positions aligned to daily index
-    pos = _positions_from_signals(pd.DatetimeIndex(prices.index), signals)
-
-    # strategy returns
+    # Position series (shifted one day so today's return uses yesterday's signal)
+    pos = _positions_from_signals(signals, daily_idx).astype(float)
     strat_ret = pos.shift(1).fillna(0.0) * daily_ret
 
-    # metrics
-    idx = pd.DatetimeIndex(prices.index)
-    period_start = idx[0].to_pydatetime()
-    period_end = idx[-1].to_pydatetime()
-    n_trades = int(prices.shape[0])
-    n_signals = int(signals.shape[0])
+    # Metrics (no datetime arithmetic with floats)
+    period_start = cast(datetime, daily_idx[0].to_pydatetime())
+    period_end = cast(datetime, daily_idx[-1].to_pydatetime())
 
-    wins = (strat_ret > 0).sum()
-    total_days = strat_ret.shape[0]
-    win_rate = float(wins / total_days) if total_days > 0 else float("nan")
+    avg_ret = float(strat_ret.mean()) if strat_ret.size else 0.0
+    vol = float(strat_ret.std(ddof=1)) if strat_ret.size > 1 else 0.0
+    sharpe = float(avg_ret / vol) if vol > 0 else float("nan")
+    cum_ret = float((1.0 + strat_ret).prod() - 1.0) if strat_ret.size else 0.0
+    mdd = _max_drawdown_from_returns(strat_ret)
 
-    avg_return = float(strat_ret.mean()) if total_days > 0 else 0.0
-    vol = float(strat_ret.std(ddof=1)) if total_days > 1 else 0.0
-    cum_return = float((1.0 + strat_ret).prod() - 1.0) if total_days > 0 else 0.0
-    sharpe = float(avg_return / vol * np.sqrt(365.0)) if vol > 0 else float("nan")
+    took_pos = pos.shift(1).fillna(0.0) != 0.0
+    wins = int((strat_ret[took_pos] > 0.0).sum())
+    total = int(took_pos.sum())
+    win_rate = float(wins / total) if total > 0 else float("nan")
 
-    max_dd = _max_drawdown_from_returns(strat_ret)
-
-    return BacktestResult(
+    bt = Backtest(
         period_start=period_start,
         period_end=period_end,
-        n_trades=n_trades,
-        n_signals=n_signals,
+        n_trades=int(daily.shape[0]),
+        n_signals=int(signals.shape[0]),
         win_rate=win_rate,
-        avg_return=avg_return,
-        cum_return=cum_return,
+        avg_return=avg_ret,
+        cum_return=cum_ret,
         volatility=vol,
         sharpe=sharpe,
-        max_drawdown=max_dd,
+        max_drawdown=mdd,
     )
-
-
-# --------------------------------------------------------------------------------------
-# Persistence
-# --------------------------------------------------------------------------------------
+    return bt, {"counts": {"prices_days": int(daily.shape[0])}}
 
 
 async def _write_metrics(
@@ -254,30 +227,11 @@ async def _write_metrics(
     card_key: str,
     model_version: str,
     horizon_days: int,
-    bt: BacktestResult,
-    extra: Dict[str, object],
+    bt: Backtest,
+    extra: Dict[str, Any],
+    note: Optional[str] = None,
 ) -> None:
-    """
-    Insert one row into metrics (JSONB params via json.dumps).
-    """
-    sql = sa.text(
-        """
-        INSERT INTO metrics (
-            card_key, model_version, horizon_days,
-            period_start, period_end,
-            n_trades, n_signals, win_rate, avg_return, cum_return,
-            volatility, sharpe, max_drawdown,
-            notes, params
-        ) VALUES (
-            :card_key, :model_version, :horizon_days,
-            :period_start, :period_end,
-            :n_trades, :n_signals, :win_rate, :avg_return, :cum_return,
-            :volatility, :sharpe, :max_drawdown,
-            :notes, :params
-        )
-        """
-    )
-
+    """Persist one metrics row; params bound as JSONB via CAST."""
     payload = {
         "card_key": card_key,
         "model_version": model_version,
@@ -292,18 +246,32 @@ async def _write_metrics(
         "volatility": bt.volatility,
         "sharpe": bt.sharpe,
         "max_drawdown": bt.max_drawdown,
-        "notes": str(extra.get("notes", "")),
-        # IMPORTANT for asyncpg JSONB: pass a JSON string
+        "notes": note or "",
         "params": json.dumps(extra),
     }
 
+    q = text(
+        """
+        INSERT INTO metrics (
+            card_key, model_version, horizon_days,
+            period_start, period_end,
+            n_trades, n_signals, win_rate, avg_return, cum_return,
+            volatility, sharpe, max_drawdown,
+            notes, params
+        ) VALUES (
+            :card_key, :model_version, :horizon_days,
+            :period_start, :period_end,
+            :n_trades, :n_signals, :win_rate, :avg_return, :cum_return,
+            :volatility, :sharpe, :max_drawdown,
+            :notes, CAST(:params AS JSONB)
+        )
+        """
+    )
     async with engine.begin() as conn:
-        await conn.execute(sql, payload)
+        await conn.execute(q, payload)
 
 
-# --------------------------------------------------------------------------------------
-# CLI / main
-# --------------------------------------------------------------------------------------
+# --------------------------- Orchestration / CLI ---------------------------
 
 
 async def run(
@@ -312,51 +280,32 @@ async def run(
     horizon_days: int,
     persist: bool,
     note: Optional[str],
-) -> BacktestResult:
-    engine = _engine()
-
-    prices_df = await _load_prices(engine, card_key)
-    daily = _daily_last_series(prices_df)
-
-    signals_df = await _load_signals(engine, card_key, model_version)
-
-    bt = _bt(daily, signals_df)
-
-    # print report
-    print("\n=== Backtest Report ===")
-    print(f"Card:          {card_key}")
-    print(f"Model version: {model_version}")
-    print(f"Horizon days:  {horizon_days}")
-    print(
-        f"Period:        {bt.period_start.isoformat()} -> {bt.period_end.isoformat()}"
+) -> None:
+    # Create engine and async session factory
+    engine = create_async_engine(settings.database_url, future=True)  # type: ignore[attr-defined]
+    SessionLocal = async_sessionmaker(
+        engine, class_=AsyncSession, expire_on_commit=False
     )
-    print(f"Trades:        {bt.n_trades}")
-    print(f"Signals:       {bt.n_signals}")
-    print(f"Win rate:      {bt.win_rate}")
-    print(f"Avg return:    {bt.avg_return:.6f}")
-    print(f"Cum return:    {bt.cum_return:.4f}")
-    print(f"Volatility:    {bt.volatility:.4f}")
-    print(f"Sharpe:        {bt.sharpe}")
-    print(f"Max drawdown:  {bt.max_drawdown:.4f}")
-    print("=======================\n")
+
+    async with SessionLocal() as session:
+        prices = await _load_prices_for_card(session, card_key)
+        signals = await _load_signals_for_card(
+            session, card_key, model_version, horizon_days
+        )
+
+    bt, _extra = _bt(prices, signals)
+    _print_report(card_key, model_version, horizon_days, bt)
 
     if persist:
-        extra: Dict[str, object] = {
-            "notes": note or "",
-            "counts": {"prices_days": int(daily.shape[0])},
-            "filters": {
-                "card_key": card_key,
-                "model_version": model_version,
-                "horizon_days": horizon_days,
-            },
-        }
-        await _write_metrics(engine, card_key, model_version, horizon_days, bt, extra)
-
-    return bt
+        await _write_metrics(
+            engine, card_key, model_version, horizon_days, bt, _extra, note
+        )
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Simple backtest & metrics writer")
+    import argparse
+
+    ap = argparse.ArgumentParser()
     ap.add_argument("--card-key", required=True)
     ap.add_argument("--model-version", required=True)
     ap.add_argument("--horizon-days", type=int, default=90)
@@ -366,11 +315,11 @@ def main() -> None:
 
     asyncio.run(
         run(
-            card_key=args.card_key,
-            model_version=args.model_version,
-            horizon_days=args.horizon_days,
-            persist=args.persist,
-            note=args.note or "",
+            args.card_key,
+            args.model_version,
+            args.horizon_days,
+            args.persist,
+            args.note or None,
         )
     )
 
