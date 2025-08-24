@@ -1,18 +1,34 @@
+# src/pkmn_factors/db/base.py
 from __future__ import annotations
-from typing import AsyncGenerator
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-from sqlalchemy.orm import DeclarativeBase
+
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
+
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+
 from pkmn_factors.config import settings
 
+# Single async engine for the app (Timescale/Postgres via asyncpg)
+engine: AsyncEngine = create_async_engine(
+    settings.DATABASE_URL,  # <-- use UPPER-CASE field from Settings
+    echo=False,
+    pool_pre_ping=True,
+)
 
-class Base(DeclarativeBase):
-    pass
+# Session factory
+SessionLocal = async_sessionmaker(
+    engine,
+    expire_on_commit=False,
+)
 
 
-engine = create_async_engine(settings.database_url, echo=False, pool_pre_ping=True)
-SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-
-
-async def get_session() -> AsyncGenerator[AsyncSession, None]:
+@asynccontextmanager
+async def get_session() -> AsyncIterator[AsyncSession]:
+    """Async context manager for a DB session."""
     async with SessionLocal() as session:
         yield session

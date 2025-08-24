@@ -1,61 +1,105 @@
 from __future__ import annotations
 
 from datetime import datetime
-from decimal import Decimal
 from typing import Optional
 
 from sqlalchemy import (
-    String,
+    BigInteger,
+    Date,
+    DateTime,
+    Float,
+    Index,
     Integer,
     Numeric,
-    DateTime,
+    String,
     Text,
     UniqueConstraint,
-    Index,
+    func,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from pkmn_factors.db.base import Base
+
+class Base(DeclarativeBase):
+    """SQLAlchemy Declarative Base."""
+
+    pass
+
+
+# ----------------------------
+# Core domain tables
+# ----------------------------
+
+
+class Card(Base):
+    __tablename__ = "cards"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    card_key: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    set_code: Mapped[str] = mapped_column(String(32))
+    rarity: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+
+    release_date: Mapped[Optional[datetime]] = mapped_column(Date, nullable=True)
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"Card(card_key={self.card_key!r}, name={self.name!r})"
 
 
 class Trade(Base):
-    """
-    Ultra-modern Pokémon TCG trade (sold listing) record.
-
-    Notes (TimescaleDB):
-      - Hypertable will partition on `timestamp`
-      - Any UNIQUE / PRIMARY KEY on a hypertable must include the partition key.
-        Therefore we use a composite PK: (id, timestamp).
-    """
-
     __tablename__ = "trades"
 
-    # Composite primary key: id + timestamp
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-
-    # MUST be part of the PK because it's the partitioning (time) column
-    timestamp: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), primary_key=True, index=True, nullable=False
-    )
-
-    source: Mapped[str] = mapped_column(String(32), nullable=False)  # ebay, pwcc, etc.
-    card_key: Mapped[str] = mapped_column(
-        String(128), nullable=False
-    )  # e.g., "SVP-053 Mew ex PSA10"
-
-    grade: Mapped[Optional[str]] = mapped_column(
-        String(16), nullable=True
-    )  # PSA10, PSA9
-    listing_type: Mapped[Optional[str]] = mapped_column(
-        String(16), nullable=True
-    )  # auction, BIN
-
-    price: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
-    currency: Mapped[str] = mapped_column(String(8), nullable=False, default="USD")
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    source: Mapped[str] = mapped_column(String(32))
+    card_key: Mapped[str] = mapped_column(String(128), index=True)
+    grade: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    listing_type: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    price: Mapped[float] = mapped_column(Numeric(12, 2))
+    currency: Mapped[str] = mapped_column(String(8))
     link: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
-        # de-dup within a minute/price/src/link combo
+        # de-dup guard (works well for scraped/tracked sources)
         UniqueConstraint("timestamp", "price", "source", "link", name="uq_trade_dedup"),
         Index("ix_trades_card_time", "card_key", "timestamp"),
     )
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"Trade(card_key={self.card_key!r}, price={self.price!r}, ts={self.timestamp!r})"
+
+
+# ----------------------------
+# Model signals (outputs)
+# ----------------------------
+
+
+class Signal(Base):
+    __tablename__ = "signals"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    # when the signal was produced (server default = now())
+    asof_ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+    # which card the signal pertains to
+    card_key: Mapped[str] = mapped_column(String(128), index=True)
+
+    # model outputs
+    horizon_days: Mapped[int] = mapped_column(Integer, default=90)
+    action: Mapped[str] = mapped_column(String(8))  # BUY | HOLD | SELL
+    conviction: Mapped[float] = mapped_column(Float)  # 0..1 confidence
+    expected_return: Mapped[float] = mapped_column(Float)  # e.g., 0.05 = +5%
+    risk: Mapped[float] = mapped_column(Float)  # annualized-ish stdev proxy
+    utility: Mapped[float] = mapped_column(Float)  # e.g., Sharpe-like
+
+    # versioning + optional features snapshot
+    model_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    features: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
+    __table_args__ = (Index("ix_signals_card_asof", "card_key", "asof_ts"),)
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"Signal(card_key={self.card_key!r}, action={self.action!r}, asof={self.asof_ts!r})"
