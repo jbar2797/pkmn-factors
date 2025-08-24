@@ -1,12 +1,11 @@
-# src/pkmn_factors/factors/features.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
-from datetime import datetime, timezone
 
 
 @dataclass(frozen=True)
@@ -32,7 +31,6 @@ class Features:
 
 
 def _to_float_series(s: pd.Series) -> pd.Series:
-    """Ensure numeric series is float (Decimal -> float)."""
     if pd.api.types.is_numeric_dtype(s):
         return s.astype(float)
     return pd.to_numeric(s, errors="coerce")
@@ -53,8 +51,10 @@ def _safe_pct_change(s: pd.Series, periods: int) -> float:
 
 def _rolling_vol(s: pd.Series, window: int) -> float:
     try:
-        v = s.pct_change().dropna().tail(window).std(ddof=1)
-        return float(v) if v is not None else float("nan")
+        r = s.pct_change().dropna().tail(window)
+        if r.empty:
+            return float("nan")
+        return float(r.std(ddof=1))
     except Exception:
         return float("nan")
 
@@ -70,7 +70,7 @@ def _max_drawdown(s: pd.Series, window: int) -> float:
             peak = max(peak, x)
             if peak > 0:
                 mdd = min(mdd, (x / peak) - 1.0)
-        return float(mdd)
+        return float(abs(mdd))
     except Exception:
         return float("nan")
 
@@ -92,22 +92,18 @@ def _zscore_latest(s: pd.Series, window: int) -> float:
 
 def build_features(df: pd.DataFrame) -> Features:
     """
-    df columns expected: timestamp (datetime64 tz-aware), price (numeric), card_key (str)
+    Requires columns:
+      - 'timestamp' (datetime)
+      - 'price' (numeric)
     """
     if df.empty:
-        return Features(
-            float("nan"),
-            float("nan"),
-            float("nan"),
-            float("nan"),
-            float("nan"),
-            float("nan"),
-            float("nan"),
-        )
+        return Features(*(float("nan"),) * 7)
 
-    # enforce types
-    prices = _to_float_series(df["price"])
-    daily = prices.resample("1D", on="timestamp").last().dropna()
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    df["price"] = _to_float_series(df["price"])
+
+    daily = df.resample("1D", on="timestamp")["price"].last().dropna()
 
     ret_7 = _safe_pct_change(daily, 7)
     ret_30 = _safe_pct_change(daily, 30)
@@ -115,13 +111,15 @@ def build_features(df: pd.DataFrame) -> Features:
     drawdown_30 = _max_drawdown(daily, 30)
     value_z = _zscore_latest(daily, 30)
 
-    # liquidity = number of trades in last 7 days
-    liq_7 = float(
-        (df.set_index("timestamp").last("7D").shape[0]) if not df.empty else 0
-    )
+    # Liquidity: number of raw trade rows in last 7 days (no .last("7D") warning)
+    try:
+        last_ts = pd.to_datetime(df["timestamp"].max(), utc=True)
+        start = last_ts - pd.Timedelta(days=7)
+        liq_7 = float(df[df["timestamp"] >= start].shape[0]) if not df.empty else 0.0
+    except Exception:
+        liq_7 = 0.0
 
-    # recency in days from last trade to now (UTC)
-    last_ts = pd.to_datetime(df["timestamp"].max(), utc=True)
+    # Recency (days) to now
     now_utc = datetime.now(timezone.utc)
     recency_days = float((now_utc - last_ts.to_pydatetime()).total_seconds() / 86400.0)
 
