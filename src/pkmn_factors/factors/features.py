@@ -1,3 +1,4 @@
+# src/pkmn_factors/factors/features.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -5,10 +6,11 @@ from typing import Dict
 
 import numpy as np
 import pandas as pd
+from datetime import datetime, timezone
 
 
 @dataclass(frozen=True)
-class PriceFeatures:
+class Features:
     ret_7: float
     ret_30: float
     risk: float
@@ -17,14 +19,31 @@ class PriceFeatures:
     liq_7: float
     recency_days: float
 
+    def as_json(self) -> Dict[str, float]:
+        return {
+            "ret_7": self.ret_7,
+            "ret_30": self.ret_30,
+            "risk": self.risk,
+            "drawdown_30": self.drawdown_30,
+            "value_z": self.value_z,
+            "liq_7": self.liq_7,
+            "recency_days": self.recency_days,
+        }
+
+
+def _to_float_series(s: pd.Series) -> pd.Series:
+    """Ensure numeric series is float (Decimal -> float)."""
+    if pd.api.types.is_numeric_dtype(s):
+        return s.astype(float)
+    return pd.to_numeric(s, errors="coerce")
+
 
 def _safe_pct_change(s: pd.Series, periods: int) -> float:
-    """Return percentage change over `periods`, robust to short or NaN series."""
     try:
         if len(s) <= periods or s.dropna().empty:
             return float("nan")
-        end = s.iloc[-1]
-        start = s.iloc[-periods - 1]
+        end = float(s.iloc[-1])
+        start = float(s.iloc[-periods - 1])
         if pd.isna(start) or start == 0:
             return float("nan")
         return float(end / start - 1.0)
@@ -34,71 +53,79 @@ def _safe_pct_change(s: pd.Series, periods: int) -> float:
 
 def _rolling_vol(s: pd.Series, window: int) -> float:
     try:
-        r = s.pct_change().dropna()
-        if r.empty:
-            return float("nan")
-        return float(r.tail(window).std(ddof=0))
+        v = s.pct_change().dropna().tail(window).std(ddof=1)
+        return float(v) if v is not None else float("nan")
     except Exception:
         return float("nan")
 
 
 def _max_drawdown(s: pd.Series, window: int) -> float:
-    """Max drawdown over a rolling window (as positive fraction)."""
     try:
-        w = s.tail(window).astype(float)
-        if w.empty:
+        w = s.tail(window).astype(float).to_numpy()
+        if w.size == 0:
             return float("nan")
-        roll_max = w.cummax()
-        dd = (w / roll_max) - 1.0
-        return float(abs(dd.min()))
+        peak = -np.inf
+        mdd = 0.0
+        for x in w:
+            peak = max(peak, x)
+            if peak > 0:
+                mdd = min(mdd, (x / peak) - 1.0)
+        return float(mdd)
     except Exception:
         return float("nan")
 
 
-def from_prices(df: pd.DataFrame) -> PriceFeatures:
+def _zscore_latest(s: pd.Series, window: int) -> float:
+    try:
+        w = s.tail(window).astype(float)
+        if w.empty:
+            return float("nan")
+        mu = float(w.mean())
+        sd = float(w.std(ddof=1))
+        if sd == 0 or pd.isna(sd):
+            return float("nan")
+        latest = float(w.iloc[-1])
+        return float((latest - mu) / sd)
+    except Exception:
+        return float("nan")
+
+
+def build_features(df: pd.DataFrame) -> Features:
     """
-    Build baseline features from a price series dataframe with a 'price' column.
-    Expects df.index to be datetime-like and increasing.
+    df columns expected: timestamp (datetime64 tz-aware), price (numeric), card_key (str)
     """
-    if "price" not in df.columns:
-        raise ValueError("prices dataframe must contain a 'price' column")
-
-    series = df["price"].astype(float)
-
-    ret_7 = _safe_pct_change(series, 7)
-    ret_30 = _safe_pct_change(series, 30)
-    risk = _rolling_vol(series, 30)
-    drawdown_30 = _max_drawdown(series, 30)
-
-    # Value vs 30-day mean as a simple z-score proxy (mean-only, no variance normalization)
-    try:
-        ma30 = (
-            float(series.tail(30).mean()) if not series.tail(30).empty else float("nan")
+    if df.empty:
+        return Features(
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
         )
-        value_z = (
-            float(series.iloc[-1] / ma30 - 1.0)
-            if ma30 and not np.isnan(ma30)
-            else float("nan")
-        )
-    except Exception:
-        value_z = float("nan")
 
-    # Liquidity proxy: number of observations in last 7 days
-    try:
-        liq_7 = float(series.last("7D").shape[0]) if not series.empty else 0.0
-    except Exception:
-        liq_7 = 0.0
+    # enforce types
+    prices = _to_float_series(df["price"])
+    daily = prices.resample("1D", on="timestamp").last().dropna()
 
-    # Recency of last trade in days (negative if last timestamp is in the future)
-    try:
-        ts = pd.to_datetime(series.index)
-        recency_days = float(
-            (pd.Timestamp.utcnow(tz="UTC") - ts.max()).total_seconds() / 86400.0
-        )
-    except Exception:
-        recency_days = float("nan")
+    ret_7 = _safe_pct_change(daily, 7)
+    ret_30 = _safe_pct_change(daily, 30)
+    risk = _rolling_vol(daily, 30)
+    drawdown_30 = _max_drawdown(daily, 30)
+    value_z = _zscore_latest(daily, 30)
 
-    return PriceFeatures(
+    # liquidity = number of trades in last 7 days
+    liq_7 = float(
+        (df.set_index("timestamp").last("7D").shape[0]) if not df.empty else 0
+    )
+
+    # recency in days from last trade to now (UTC)
+    last_ts = pd.to_datetime(df["timestamp"].max(), utc=True)
+    now_utc = datetime.now(timezone.utc)
+    recency_days = float((now_utc - last_ts.to_pydatetime()).total_seconds() / 86400.0)
+
+    return Features(
         ret_7=ret_7,
         ret_30=ret_30,
         risk=risk,
@@ -107,15 +134,3 @@ def from_prices(df: pd.DataFrame) -> PriceFeatures:
         liq_7=liq_7,
         recency_days=recency_days,
     )
-
-
-def to_json(feats: PriceFeatures) -> Dict[str, float]:
-    return {
-        "ret_7": feats.ret_7,
-        "ret_30": feats.ret_30,
-        "risk": feats.risk,
-        "drawdown_30": feats.drawdown_30,
-        "value_z": feats.value_z,
-        "liq_7": feats.liq_7,
-        "recency_days": feats.recency_days,
-    }
