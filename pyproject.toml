@@ -48,6 +48,7 @@ packages = ["src/pkmn_factors"]
 dev = [
     "black>=25.1.0",
     "mypy>=1.17.1",
+    "pandas-stubs>=2.3.0.250703",
     "pre-commit>=4.3.0",
     "pytest>=8.4.1",
     "pytest-cov>=6.2.1",
