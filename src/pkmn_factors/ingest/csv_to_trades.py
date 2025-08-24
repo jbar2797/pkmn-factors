@@ -1,83 +1,94 @@
 from __future__ import annotations
 
 import asyncio
-import sys
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Iterable
 
 import pandas as pd
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
 
-from pkmn_factors.db.base import engine
-from pkmn_factors.db.models import Trade
-
-USAGE = "Usage: python -m pkmn_factors.ingest.csv_to_trades <path/to/trades.csv>"
+from pkmn_factors.db.base import get_engine
 
 
-async def main(path: str) -> None:
-    # --- Load CSV ---
-    df = pd.read_csv(path)
+def _load_csv(csv_path: Path) -> pd.DataFrame:
+    """Load a CSV and normalize column names/types."""
+    if not csv_path.exists():
+        raise FileNotFoundError(csv_path)
 
-    # Ensure required logical columns exist
-    if "card_key" not in df.columns:
-        df["card_key"] = "DEMO"
-    if "currency" not in df.columns:
-        df["currency"] = "USD"
+    df = pd.read_csv(csv_path)
 
-    # Parse timestamps to tz-aware UTC
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+    # Accept either 'ts' or 'timestamp' in the CSV, normalize to 'timestamp'
+    if "timestamp" not in df.columns and "ts" in df.columns:
+        df = df.rename(columns={"ts": "timestamp"})
 
-    # Ensure required columns exist even if missing in CSV
-    required = ["timestamp", "price", "source", "card_key", "currency"]
-    for col in required:
-        if col not in df.columns:
-            df[col] = None
+    required = {"timestamp", "price", "card_key"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"CSV is missing columns: {sorted(missing)}")
 
-    # Drop rows lacking minimal required fields
-    df = df.dropna(subset=["timestamp", "price", "source"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    df["price"] = pd.to_numeric(df["price"], errors="coerce").astype(float)
+    df["card_key"] = df["card_key"].astype(str)
 
-    # Convert to list-of-dicts with Python-native types
-    rows: List[Dict[str, Any]] = []
-    for r in df.to_dict(orient="records"):
-        ts = r["timestamp"]
-        r["timestamp"] = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
-        rows.append(
-            {
-                "timestamp": r["timestamp"],
-                "source": r.get("source"),
-                "card_key": r.get("card_key"),
-                "grade": r.get("grade"),
-                "listing_type": r.get("listing_type"),
-                "price": r.get("price"),
-                "currency": r.get("currency", "USD"),
-                "link": r.get("link"),
-            }
-        )
+    # Drop rows with any nulls in required fields
+    df = df.dropna(subset=["timestamp", "price", "card_key"])
 
-    if not rows:
-        print(f"No valid rows found in {path}. Nothing to insert.")
-        return
+    return df[["timestamp", "price", "card_key"]]
 
-    # --- Build INSERT ... ON CONFLICT DO NOTHING (PostgreSQL dialect) ---
-    # Use the table object explicitly for the dialect insert to satisfy typing.
-    stmt = (
-        pg_insert(Trade.__table__)  # type: ignore[arg-type]
-        .values(rows)
-        .on_conflict_do_nothing(index_elements=["timestamp", "price", "source", "link"])
+
+async def _bulk_insert(engine: AsyncEngine, rows: Iterable[dict]) -> int:
+    """
+    Insert rows into trades. Assumes table schema:
+      trades(timestamp timestamptz, price numeric, card_key text)
+    """
+    q = text(
+        """
+        INSERT INTO trades (timestamp, price, card_key)
+        VALUES (:timestamp, :price, :card_key)
+        """
     )
 
-    # --- Execute in a single transaction ---
+    count = 0
     async with engine.begin() as conn:
-        try:
-            await conn.execute(stmt)
-            print(f"Inserted rows (attempted): {len(rows)}")
-        except IntegrityError:
-            # Normally avoided by DO NOTHING, but kept for safety.
-            print("IntegrityError: duplicates encountered (skipped).")
+        # Executemany with a list[dict]
+        rp = await conn.execute(q, list(rows))
+        # Some drivers don't report rowcount reliably in executemany; be tolerant.
+        count = getattr(rp, "rowcount", 0) or 0
+    return int(count)
+
+
+async def run(csv_path_str: str) -> None:
+    csv_path = Path(csv_path_str)
+    df = _load_csv(csv_path)
+
+    engine = get_engine()  # <- get a real AsyncEngine (not a callable)
+    payload = (
+        {
+            "timestamp": pd.to_datetime(ts, utc=True).to_pydatetime(),
+            "price": float(price),
+            "card_key": str(card),
+        }
+        for ts, price, card in df.itertuples(index=False, name=None)
+    )
+
+    inserted = await _bulk_insert(engine, payload)
+    print(f"Inserted ~{inserted} rows from {csv_path.name}")
+
+
+def main() -> None:
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Load a CSV of trades into the DB.")
+    ap.add_argument(
+        "--csv",
+        required=True,
+        help="Path to CSV with columns: timestamp|ts, price, card_key",
+    )
+    args = ap.parse_args()
+
+    asyncio.run(run(args.csv))
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print(USAGE)
-        sys.exit(1)
-    asyncio.run(main(sys.argv[1]))
+    main()
