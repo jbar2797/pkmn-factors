@@ -156,9 +156,13 @@ def _positions_from_signals(index: pd.DatetimeIndex, signals: pd.DataFrame) -> S
         return 0.0
 
     for row in signals.itertuples(index=False):
-        # typing: make pandas happy about inputs here
         ts = pd.to_datetime(getattr(row, "asof_ts"), utc=True)  # type: ignore[arg-type]
-        loc = int(pos.index.searchsorted(ts))
+        # searchsorted can return scalar or array depending on stubs; normalize to int
+        loc_raw = pos.index.searchsorted(ts)  # type: ignore[no-untyped-call]
+        if isinstance(loc_raw, (list, np.ndarray)):
+            loc = int(loc_raw[0]) if len(loc_raw) else 0
+        else:
+            loc = int(loc_raw)
         if loc < len(pos.index):
             pos.iloc[loc:] = _act_to_pos(str(getattr(row, "action")))
     return pos
@@ -171,9 +175,11 @@ def _max_drawdown_from_returns(ret: Series) -> float:
     if ret.empty:
         return float("nan")
     eq_curve: pd.Series = (1.0 + ret.fillna(0.0)).cumprod()
-    peak = eq_curve.cummax()
-    dd = ((eq_curve / peak) - 1.0).min()
-    return float(abs(dd))
+    peak: pd.Series = eq_curve.cummax()
+    rel: pd.Series = cast(pd.Series, eq_curve / peak)
+    dd_ser: pd.Series = rel - 1.0
+    dd_min = float(dd_ser.min())
+    return float(abs(dd_min))
 
 
 def _bt(prices: Series, signals: pd.DataFrame) -> BacktestResult:
