@@ -1,32 +1,33 @@
 from __future__ import annotations
 
 import os
-from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class _Settings(BaseSettings):
-    # read from env at runtime; default "" keeps mypy happy
-    DATABASE_URL: str = Field(
-        default_factory=lambda: os.getenv("DATABASE_URL", ""),
-        alias="DATABASE_URL",
+class Settings(BaseSettings):
+    """
+    Project-wide configuration.
+
+    Primary DB is read from env var DATABASE_URL.
+    Example: postgresql+asyncpg://postgres:postgres@localhost:5432/pkmn
+    """
+
+    DATABASE_URL: str = (
+        os.getenv("DATABASE_URL")
+        or "postgresql+asyncpg://postgres:postgres@localhost:5432/pkmn"
     )
 
+    # Optional: read a local .env if present
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # Compatibility shim: earlier code used `settings.database_url`
     @property
     def database_url(self) -> str:
-        # fail loudly at runtime if the variable is missing
-        if not self.DATABASE_URL:
-            raise ValueError(
-                "DATABASE_URL is not set. Example: "
-                "postgresql+asyncpg://postgres:postgres@localhost/pkmn"
-            )
         return self.DATABASE_URL
 
 
-# single, importable settings object
-settings: _Settings = _Settings()
-
-
-class AppInfo(BaseModel):
-    name: str = "pkmn-factors"
-    version: str = "0.0.1"
+settings = Settings()

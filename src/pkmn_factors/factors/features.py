@@ -34,7 +34,7 @@ class Features:
 
 
 def _to_float_series(s: pd.Series) -> pd.Series:
-    """Ensure a numeric (float) series even if input has Decimals/strings."""
+    """Ensure numeric (float) dtype even if input has Decimals/strings."""
     return pd.to_numeric(s, errors="coerce").astype(float)
 
 
@@ -102,7 +102,7 @@ def _z_score_latest(s: pd.Series, window: int) -> float:
 
 def build_features(df: pd.DataFrame) -> Features:
     """
-    Build the feature vector from raw trades/prices.
+    Build a feature vector from raw trades/prices.
 
     Required columns in `df`:
       - 'timestamp' (datetime-like; tz-naive or tz-aware OK)
@@ -111,22 +111,19 @@ def build_features(df: pd.DataFrame) -> Features:
     if df.empty:
         return Features(*(float("nan"),) * 7)
 
-    # normalize types
     d = df.copy()
     d["timestamp"] = pd.to_datetime(d["timestamp"], utc=True)
     d["price"] = _to_float_series(d["price"])
 
-    # daily last observed price series
     daily = d.resample("1D", on="timestamp")["price"].last().dropna()
     if daily.shape[0] == 0:
         return Features(*(float("nan"),) * 7)
 
-    # price/return/risks
     ret_7 = _safe_pct_change(daily, 7)
     ret_30 = _safe_pct_change(daily, 30)
     risk = _rolling_vol(daily, 30)
     drawdown_30 = _max_drawdown(daily, 30)
-    value_z = _z_score_latest(daily, 30)
+    value_z = _z_score_latest(daily, 90)
 
     # liquidity: number of raw rows in last 7 days (no .last('7D') warning)
     try:
