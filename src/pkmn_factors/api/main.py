@@ -11,8 +11,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from pkmn_factors.config import settings  # type: ignore[attr-defined]
-from pkmn_factors.ingest.csv_to_trades import ingest_csv
 from pkmn_factors.eval.backtest import run as run_backtest
+from pkmn_factors.ingest.csv_to_trades import ingest_csv
 from pkmn_factors.universe import load_universe
 
 app = FastAPI(title="pkmn-factors API")
@@ -78,11 +78,11 @@ async def metrics_latest(limit: int = 25) -> list[dict]:
                 await session.execute(
                     text(
                         """
-                    SELECT asof_ts, card_key, model_version, horizon_days, cum_return, sharpe
-                    FROM metrics
-                    ORDER BY asof_ts DESC
-                    LIMIT :limit
-                    """
+                        SELECT asof_ts, card_key, model_version, horizon_days, cum_return, sharpe
+                        FROM metrics
+                        ORDER BY asof_ts DESC
+                        LIMIT :limit
+                        """
                     ),
                     {"limit": limit},
                 )
@@ -104,5 +104,5 @@ STATIC_DIR = Path(__file__).parent / "static"
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/ui", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
 
-
+# ---- universe router (JSON + dashboard) ----
 app.include_router(universe_router)
