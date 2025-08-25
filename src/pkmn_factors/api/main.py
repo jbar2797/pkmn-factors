@@ -106,4 +106,3 @@ app.mount("/ui", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
 
 # ---- include extra API routes (/universe/top, /dashboard, etc.) ----
 app.include_router(universe_router)
-
