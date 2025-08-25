@@ -134,3 +134,4 @@ if __name__ == "__main__":
             currency_default=args.currency,
         )
     )
+
