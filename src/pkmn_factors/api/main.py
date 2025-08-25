@@ -1,3 +1,4 @@
+# src/pkmn_factors/api/main.py
 from __future__ import annotations
 
 from pathlib import Path
@@ -104,5 +105,5 @@ STATIC_DIR = Path(__file__).parent / "static"
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/ui", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
 
-# ---- universe router (JSON + dashboard) ----
+# ---- include extra API routes (/universe/top, /dashboard, etc.) ----
 app.include_router(universe_router)
