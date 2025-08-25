@@ -18,7 +18,7 @@ async def _backtest_one(
     model_version: str,
     horizon_days: int,
     persist: bool,
-    note: Optional[str],
+    note: str | None,
     sem: asyncio.Semaphore,
 ) -> None:
     """Run a single backtest for one card, with concurrency control."""
@@ -34,13 +34,15 @@ async def _backtest_one(
 
 async def _refresh_trades_daily_cagg(conn: AsyncConnection) -> None:
     """
-    TimescaleDB requires the refresh to run outside a transaction.
-    Flip the connection into AUTOCOMMIT for the call.
+    TimescaleDB requires the refresh procedure to run outside a txn.
+    We flip the connection to AUTOCOMMIT and call the procedure.
     """
-    conn_opt = cast(
-        AsyncConnection, conn.execution_options(isolation_level="AUTOCOMMIT")
+    # IMPORTANT: On this SQLAlchemy version, execution_options is async -> await it.
+    conn_autocommit = cast(
+        AsyncConnection,
+        await conn.execution_options(isolation_level="AUTOCOMMIT"),
     )
-    await conn_opt.exec_driver_sql(
+    await conn_autocommit.exec_driver_sql(
         "CALL refresh_continuous_aggregate('public.trades_daily', NULL, NULL);"
     )
 
@@ -57,10 +59,11 @@ async def run_nightly(
     """Run nightly backtests for the given universe of card keys."""
     sem = asyncio.Semaphore(max_concurrency)
 
+    # Launch backtest tasks concurrently (bounded by the semaphore)
     tasks = [
         asyncio.create_task(
             _backtest_one(
-                card_key=k,
+                k,
                 model_version=model_version,
                 horizon_days=horizon_days,
                 persist=persist,
@@ -73,11 +76,14 @@ async def run_nightly(
     if tasks:
         await asyncio.gather(*tasks)
 
+    # Optionally refresh daily CAGG after backtests
     if refresh_cagg:
         engine = create_async_engine(settings.database_url, future=True)  # type: ignore[attr-defined]
-        async with engine.connect() as conn:  # connect() (not begin) -> no txn
-            await _refresh_trades_daily_cagg(conn)
-        await engine.dispose()
+        try:
+            async with engine.connect() as conn:  # connect() (not begin) -> no txn
+                await _refresh_trades_daily_cagg(conn)
+        finally:
+            await engine.dispose()
 
 
 def _parse_args() -> argparse.Namespace:
@@ -85,10 +91,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--universe", type=Path, required=True, help="CSV of card_keys")
     p.add_argument("--model-version", required=True)
     p.add_argument("--horizon-days", type=int, default=90)
-    p.add_argument("--persist", action="store_true")
+    p.add_argument("--persist", action="store_true", help="Persist metrics/results")
     p.add_argument("--note", default=None)
-    p.add_argument("--max-concurrency", type=int, default=4)
-    p.add_argument("--refresh-cagg", action="store_true")
+    p.add_argument("--max-concurrency", type=int, default=5)
+    p.add_argument(
+        "--refresh-cagg",
+        action="store_true",
+        help="Refresh trades_daily continuous aggregate after backtests",
+    )
     return p.parse_args()
 
 
@@ -100,10 +110,10 @@ def main() -> None:
             universe_keys=universe,
             model_version=args.model_version,
             horizon_days=args.horizon_days,
-            persist=bool(args.persist),
+            persist=args.persist,
             note=(args.note or None),
             max_concurrency=args.max_concurrency,
-            refresh_cagg=bool(args.refresh_cagg),
+            refresh_cagg=args.refresh_cagg,
         )
     )
 
