@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>pkmn-factors — metrics</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+    :root { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial; }
+    body { margin: 24px; color: #111; }
+    h1 { margin: 0 0 16px 0; font-size: 20px; }
+    table { border-collapse: collapse; width: 100%; max-width: 980px; }
+    th, td { border: 1px solid #ddd; padding: 8px 10px; font-size: 14px; }
+    th { background: #f6f7f9; text-align: left; }
+    tr:nth-child(even) { background: #fafafa; }
+    .muted { color: #666; font-size: 12px; }
+    .row { display:flex; gap:12px; align-items:center; margin-bottom: 14px; }
+    input[type="number"] { width: 80px; }
+    button { padding: 6px 10px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>Latest metrics</h1>
+  <div class="row">
+    <label>Limit <input id="limit" type="number" min="1" value="25"/></label>
+    <button id="reload">Reload</button>
+    <span class="muted">API: <code>/metrics/latest?limit=…</code></span>
+  </div>
+  <table id="tbl">
+    <thead>
+      <tr>
+        <th>asof_ts</th>
+        <th>card_key</th>
+        <th>model_version</th>
+        <th>horizon_days</th>
+        <th>cum_return</th>
+        <th>sharpe</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <h1 style="margin-top:24px">Universe</h1>
+  <div class="row"><span class="muted">From <code>data/universe_demo.csv</code></span></div>
+  <ul id="universe"></ul>
+
+  <script>
+    async function fetchMetrics(limit=25) {
+      const res = await fetch(`/metrics/latest?limit=${limit}`);
+      if (!res.ok) throw new Error("metrics fetch failed");
+      return res.json();
+    }
+    async function fetchUniverse() {
+      const res = await fetch(`/universe`);
+      if (!res.ok) throw new Error("universe fetch failed");
+      return res.json();
+    }
+    function renderMetrics(rows) {
+      const tbody = document.querySelector("#tbl tbody");
+      tbody.innerHTML = "";
+      for (const r of rows) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${r.asof_ts ?? ""}</td>
+          <td>${r.card_key ?? ""}</td>
+          <td>${r.model_version ?? ""}</td>
+          <td>${r.horizon_days ?? ""}</td>
+          <td>${r.cum_return ?? ""}</td>
+          <td>${r.sharpe ?? ""}</td>`;
+        tbody.appendChild(tr);
+      }
+    }
+    function renderUniverse(keys) {
+      const ul = document.querySelector("#universe");
+      ul.innerHTML = "";
+      for (const k of keys) {
+        const li = document.createElement("li");
+        li.textContent = k;
+        ul.appendChild(li);
+      }
+    }
+    async function boot() {
+      const limit = Number(document.getElementById("limit").value || 25);
+      const [rows, uni] = await Promise.all([fetchMetrics(limit), fetchUniverse()]);
+      renderMetrics(rows); renderUniverse(uni);
+    }
+    document.getElementById("reload").addEventListener("click", boot);
+    boot();
+  </script>
+</body>
+</html>

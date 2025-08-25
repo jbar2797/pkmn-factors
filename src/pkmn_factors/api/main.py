@@ -1,73 +1,104 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from ..config import Settings
-from ..eval.backtest import run as run_backtest
-from ..ingest.csv_to_trades import ingest_csv
-from .schemas import BacktestRequest, HealthResponse, IngestCSVRequest
+from pkmn_factors.config import settings  # type: ignore[attr-defined]
+from pkmn_factors.ingest.csv_to_trades import ingest_csv
+from pkmn_factors.eval.backtest import run as run_backtest
+from pkmn_factors.universe import load_universe
 
-# Load env-backed config (expects DATABASE_URL)
-_settings = Settings()
+app = FastAPI(title="pkmn-factors API")
 
-_engine: Optional[AsyncEngine] = None
-
-
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    global _engine
-    _engine = create_async_engine(_settings.DATABASE_URL, future=True)  # type: ignore[attr-defined]
-    try:
-        yield
-    finally:
-        if _engine is not None:
-            await _engine.dispose()
+# ---- DB session factory ----
+engine = create_async_engine(settings.database_url, future=True)  # type: ignore[attr-defined]
+SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
-app = FastAPI(title="pkmn-factors API", version="0.1.0", lifespan=lifespan)
+@app.get("/health")
+async def health() -> dict[str, str]:
+    # simple connectivity check
+    async with engine.begin():
+        pass
+    return {"status": "ok"}
 
 
-@app.get("/health", response_model=HealthResponse)
-async def health() -> HealthResponse:
-    assert _engine is not None
-    try:
-        async with _engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-        return HealthResponse(status="ok", db="up")
-    except Exception as e:  # pragma: no cover - surface raw for now
-        raise HTTPException(status_code=500, detail=str(e))
+# ---- ingest CSV ----
+class IngestCSVRequest(BaseModel):
+    path: str
+    source: str = "api"
+    currency: str = "USD"
+    card_key_override: Optional[str] = None
 
 
 @app.post("/ingest/csv")
-async def api_ingest_csv(req: IngestCSVRequest) -> dict:
-    try:
-        inserted = await ingest_csv(
-            Path(req.path),
-            source=req.source,
-            currency=req.currency,
-            card_key_override=req.card_key_override,
-        )
-        return {"inserted": inserted}
-    except Exception as e:  # pragma: no cover
-        raise HTTPException(status_code=400, detail=str(e))
+async def ingest_csv_endpoint(req: IngestCSVRequest) -> dict[str, int]:
+    p = Path(req.path)
+    if not p.exists():
+        raise HTTPException(400, f"File not found: {p}")
+    inserted = await ingest_csv(
+        p,
+        source=req.source,
+        currency=req.currency,
+        card_key_override=req.card_key_override,
+    )
+    return {"inserted": inserted}
+
+
+# ---- backtest ----
+class BacktestRequest(BaseModel):
+    card_key: str
+    model_version: str
+    horizon_days: int = 90
+    persist: bool = False
+    note: Optional[str] = None
 
 
 @app.post("/backtest")
-async def api_backtest(req: BacktestRequest) -> dict:
-    try:
-        await run_backtest(
-            req.card_key,
-            req.model_version,
-            req.horizon_days,
-            req.persist,
-            req.note,
+async def backtest_endpoint(req: BacktestRequest) -> dict[str, str]:
+    await run_backtest(
+        req.card_key, req.model_version, req.horizon_days, req.persist, req.note
+    )
+    return {"status": "ok"}
+
+
+# ---- latest metrics ----
+@app.get("/metrics/latest")
+async def metrics_latest(limit: int = 25) -> list[dict]:
+    async with SessionLocal() as session:
+        rows = (
+            (
+                await session.execute(
+                    text(
+                        """
+                    SELECT asof_ts, card_key, model_version, horizon_days, cum_return, sharpe
+                    FROM metrics
+                    ORDER BY asof_ts DESC
+                    LIMIT :limit
+                    """
+                    ),
+                    {"limit": limit},
+                )
+            )
+            .mappings()
+            .all()
         )
-        return {"ok": True}
-    except Exception as e:  # pragma: no cover
-        raise HTTPException(status_code=400, detail=str(e))
+        return [dict(r) for r in rows]
+
+
+# ---- universe (file-backed) ----
+@app.get("/universe")
+async def universe(path: str = "data/universe_demo.csv") -> list[str]:
+    return sorted(load_universe(Path(path)))
+
+
+# ---- static UI (/ui) ----
+STATIC_DIR = Path(__file__).parent / "static"
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/ui", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
