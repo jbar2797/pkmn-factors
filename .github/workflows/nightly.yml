@@ -1,29 +1,30 @@
-name: nightly
+name: run-nightly
 
 on:
   workflow_dispatch:
   schedule:
-    # 07:15 UTC daily
-    - cron: "15 7 * * *"
+    - cron: "17 07 * * *" # 07:17 UTC daily (adjust if you like)
   push:
-    branches:
-      - feat/nightly-runner-v2
+    branches: [ "**" ]
+    paths:
+      - ".github/workflows/nightly.yml"
+      - "src/pkmn_factors/**"
 
 jobs:
   run-nightly:
     runs-on: ubuntu-latest
 
+    # Use a TimescaleDB image so the extension exists
     services:
-      db:
-        image: timescale/timescaledb:2.16.1-pg16
+      postgres:
+        image: timescale/timescaledb:2.14.2-pg15
+        ports: ["5432:5432"]
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: pkmn
-        ports:
-          - 5432:5432
         options: >-
-          --health-cmd="pg_isready -U postgres -d pkmn"
+          --health-cmd="pg_isready -U postgres"
           --health-interval=10s
           --health-timeout=5s
           --health-retries=30
@@ -46,27 +47,34 @@ jobs:
           python-version: "3.12"
 
       - name: Install uv
-        run: pipx install uv
+        run: |
+          pipx install uv
+          uv --version
+
+      - name: Create virtualenv (.venv) and expose it to later steps
+        run: |
+          uv venv .venv
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Install PostgreSQL client
         run: |
           sudo apt-get update
           sudo apt-get install -y postgresql-client
 
-      - name: Wait for DB and create Timescale extension
+      - name: Wait for DB & create Timescale extension
         run: |
-          # Wait until DB accepts connections
           for i in {1..60}; do
-            psql -c "SELECT 1;" && break
-            echo "DB not ready yet..."; sleep 2
+            if pg_isready -h "$PGHOST" -p "$PGPORT" -U "$PGUSER"; then
+              break
+            fi
+            sleep 1
           done
-          # Ensure the extension exists (fresh DBs won’t have it)
-          psql -c 'CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;'
-          # Quick smoke
-          psql -c "SELECT extname, extversion FROM pg_extension WHERE extname='timescaledb';"
+          psql -h "$PGHOST" -U "$PGUSER" -d "$PGDATABASE" -c "CREATE EXTENSION IF NOT EXISTS timescaledb;"
 
       - name: Install deps (runtime + dev)
-        run: uv pip install -e ".[dev]"
+        run: |
+          uv pip install -e ".[dev]"
 
       - name: Lint/Type/Test (sanity)
         run: |
@@ -76,7 +84,8 @@ jobs:
           uv run pytest -q
 
       - name: Run migrations
-        run: uv run alembic upgrade head
+        run: |
+          PYTHONPATH=src uv run alembic upgrade head
 
       - name: Run nightly
         run: |
@@ -85,5 +94,4 @@ jobs:
             --model-version bhs_baseline_v2 \
             --horizon-days 90 \
             --persist \
-            --refresh-cagg \
-            --max-concurrency 4
+            --refresh-cagg
