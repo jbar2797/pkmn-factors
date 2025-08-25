@@ -1,47 +1,73 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, Depends
-from pydantic import BaseModel
-import pandas as pd
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Optional
 
-from sqlalchemy import select, func, text
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import FastAPI, HTTPException
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from pkmn_factors.api.demo import router as demo_router
-from pkmn_factors.core.scoring_rt import compute_score_rt
+from ..config import Settings
+from ..eval.backtest import run as run_backtest
+from ..ingest.csv_to_trades import ingest_csv
+from .schemas import BacktestRequest, HealthResponse, IngestCSVRequest
 
-# DB plumbing for health check
-from pkmn_factors.db.base import get_session
-from pkmn_factors.db.models import Trade
+# Load env-backed config (expects DATABASE_URL)
+_settings = Settings()
 
-
-app = FastAPI(title="PKMN Factors (RT)")
-
-# existing demo routes
-app.include_router(demo_router)
+_engine: Optional[AsyncEngine] = None
 
 
-class ScorePayload(BaseModel):
-    row: dict
-    trades_csv_path: str | None = None
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global _engine
+    _engine = create_async_engine(_settings.DATABASE_URL, future=True)  # type: ignore[attr-defined]
+    try:
+        yield
+    finally:
+        if _engine is not None:
+            await _engine.dispose()
 
 
-@app.post("/score")
-def score(payload: ScorePayload):
-    trades = (
-        pd.read_csv(payload.trades_csv_path, parse_dates=["timestamp"])
-        if payload.trades_csv_path
-        else None
-    )
-    return compute_score_rt(payload.row, trades)
+app = FastAPI(title="pkmn-factors API", version="0.1.0", lifespan=lifespan)
 
 
-# -------- Health / DB endpoint --------
-@app.get("/health/db")
-async def health_db(session: AsyncSession = Depends(get_session)):
-    # simple ping
-    await session.execute(text("SELECT 1"))
-    # count rows in trades hypertable
-    result = await session.execute(select(func.count()).select_from(Trade))
-    count = result.scalar_one()
-    return {"ok": True, "trades": int(count)}
+@app.get("/health", response_model=HealthResponse)
+async def health() -> HealthResponse:
+    assert _engine is not None
+    try:
+        async with _engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        return HealthResponse(status="ok", db="up")
+    except Exception as e:  # pragma: no cover - surface raw for now
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ingest/csv")
+async def api_ingest_csv(req: IngestCSVRequest) -> dict:
+    try:
+        inserted = await ingest_csv(
+            Path(req.path),
+            source=req.source,
+            currency=req.currency,
+            card_key_override=req.card_key_override,
+        )
+        return {"inserted": inserted}
+    except Exception as e:  # pragma: no cover
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/backtest")
+async def api_backtest(req: BacktestRequest) -> dict:
+    try:
+        await run_backtest(
+            req.card_key,
+            req.model_version,
+            req.horizon_days,
+            req.persist,
+            req.note,
+        )
+        return {"ok": True}
+    except Exception as e:  # pragma: no cover
+        raise HTTPException(status_code=400, detail=str(e))
