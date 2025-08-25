@@ -3,7 +3,7 @@ name: nightly
 on:
   workflow_dispatch:
   schedule:
-    # 07:15 UTC every day — adjust to taste
+    # 07:15 UTC daily
     - cron: "15 7 * * *"
   push:
     branches:
@@ -26,10 +26,15 @@ jobs:
           --health-cmd="pg_isready -U postgres -d pkmn"
           --health-interval=10s
           --health-timeout=5s
-          --health-retries=15
+          --health-retries=30
 
     env:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/pkmn
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: pkmn
 
     steps:
       - name: Checkout
@@ -42,6 +47,23 @@ jobs:
 
       - name: Install uv
         run: pipx install uv
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Wait for DB and create Timescale extension
+        run: |
+          # Wait until DB accepts connections
+          for i in {1..60}; do
+            psql -c "SELECT 1;" && break
+            echo "DB not ready yet..."; sleep 2
+          done
+          # Ensure the extension exists (fresh DBs won’t have it)
+          psql -c 'CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;'
+          # Quick smoke
+          psql -c "SELECT extname, extversion FROM pg_extension WHERE extname='timescaledb';"
 
       - name: Install deps (runtime + dev)
         run: uv pip install -e ".[dev]"
