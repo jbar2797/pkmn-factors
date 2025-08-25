@@ -1,48 +1,46 @@
-name: nightly
+# .github/workflows/nightly.yml
+name: Nightly Backtests
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # 06:00 UTC daily
-  workflow_dispatch: {}
+    - cron: "0 7 * * *"   # 07:00 UTC nightly
+  workflow_dispatch:
 
 jobs:
-  run-nightly:
+  nightly:
     runs-on: ubuntu-latest
 
     services:
       timescaledb:
-        image: timescale/timescaledb:latest-pg15
+        image: timescale/timescaledb-ha:pg16-latest
+        ports: ["5432:5432"]
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_USER: postgres
           POSTGRES_DB: pkmn
-        ports: ["5432:5432"]
         options: >-
-          --health-cmd="pg_isready -U postgres"
+          --health-cmd="pg_isready -U postgres -d pkmn"
           --health-interval=10s
           --health-timeout=5s
-          --health-retries=10
+          --health-retries=30
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up Python & uv
+        uses: astral-sh/setup-uv@v3
         with:
           python-version: "3.12"
 
-      - name: Install uv
-        run: pipx install uv
-
-      - name: Install deps
+      - name: Install (editable)
         run: |
-          uv pip install --system -e .
+          uv pip install -e .
 
-      - name: Create schema & apply alembic
+      - name: Apply migrations
         env:
           DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/pkmn
         run: |
-          PYTHONPATH=src alembic upgrade head
+          PYTHONPATH=src uv run alembic upgrade head
 
       - name: Run nightly backtests
         env:
@@ -54,4 +52,5 @@ jobs:
             --horizon-days 90 \
             --persist \
             --refresh-cagg \
-            --max-concurrency 5
+            --max-concurrency 5 \
+            --note "github nightly"
