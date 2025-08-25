@@ -1,94 +1,136 @@
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
 
 import pandas as pd
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from pkmn_factors.db.base import get_engine
+from pkmn_factors.config import settings
+
+# Executemany payload item (named binds)
+RowMap = Dict[str, Any]
 
 
-def _load_csv(csv_path: Path) -> pd.DataFrame:
-    """Load a CSV and normalize column names/types."""
-    if not csv_path.exists():
-        raise FileNotFoundError(csv_path)
+def _to_utc(s: pd.Series) -> pd.Series:
+    """Coerce datetimes to tz-aware UTC."""
+    return pd.to_datetime(s, utc=True)
 
+
+def _load_csv_rows(
+    csv_path: Path,
+    source: str,
+    override_card_key: Optional[str] = None,
+    currency_default: str = "USD",
+) -> List[RowMap]:
+    """
+    Read CSV and build rows for INSERT.
+    Expected CSV columns minimum: timestamp, price, card_key
+    Optional CSV column: currency  (if missing -> currency_default)
+    """
     df = pd.read_csv(csv_path)
-
-    # Accept either 'ts' or 'timestamp' in the CSV, normalize to 'timestamp'
-    if "timestamp" not in df.columns and "ts" in df.columns:
-        df = df.rename(columns={"ts": "timestamp"})
 
     required = {"timestamp", "price", "card_key"}
     missing = required - set(df.columns)
     if missing:
-        raise ValueError(f"CSV is missing columns: {sorted(missing)}")
+        raise ValueError(f"CSV missing required columns: {sorted(missing)}")
 
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    df["price"] = pd.to_numeric(df["price"], errors="coerce").astype(float)
+    # Normalize
+    df["timestamp"] = _to_utc(df["timestamp"])
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
     df["card_key"] = df["card_key"].astype(str)
 
-    # Drop rows with any nulls in required fields
-    df = df.dropna(subset=["timestamp", "price", "card_key"])
+    # If the CSV contains currency, use it; otherwise fill default
+    if "currency" in df.columns:
+        df["currency"] = df["currency"].fillna(currency_default).astype(str)
+    else:
+        df["currency"] = currency_default
 
-    return df[["timestamp", "price", "card_key"]]
+    df = df[["timestamp", "price", "card_key", "currency"]].dropna()
+
+    rows: List[RowMap] = []
+    for ts, price, ck, ccy in df.itertuples(index=False, name=None):  # type: ignore[misc]
+        # Ensure python-native types
+        if hasattr(ts, "to_pydatetime"):
+            ts_dt: datetime = ts.to_pydatetime().astimezone(timezone.utc)
+        else:
+            ts_dt = pd.to_datetime(ts, utc=True).to_pydatetime()
+
+        rows.append(
+            {
+                "timestamp": ts_dt,
+                "source": source,
+                "card_key": str(override_card_key) if override_card_key else str(ck),
+                "price": float(price),
+                "currency": str(ccy),
+            }
+        )
+
+    return rows
 
 
-async def _bulk_insert(engine: AsyncEngine, rows: Iterable[dict]) -> int:
+async def _bulk_insert(engine: AsyncEngine, rows: List[RowMap]) -> int:
     """
-    Insert rows into trades. Assumes table schema:
-      trades(timestamp timestamptz, price numeric, card_key text)
+    Insert rows into trades with explicit column list including NOT NULL fields.
+    Uses named binds -> pass a list of dicts.
     """
+    if not rows:
+        return 0
+
     q = text(
         """
-        INSERT INTO trades (timestamp, price, card_key)
-        VALUES (:timestamp, :price, :card_key)
+        INSERT INTO trades (timestamp, source, card_key, price, currency)
+        VALUES (:timestamp, :source, :card_key, :price, :currency)
         """
     )
 
-    count = 0
     async with engine.begin() as conn:
-        # Executemany with a list[dict]
-        rp = await conn.execute(q, list(rows))
-        # Some drivers don't report rowcount reliably in executemany; be tolerant.
-        count = getattr(rp, "rowcount", 0) or 0
-    return int(count)
+        await conn.execute(q, rows)
+
+    return len(rows)
 
 
-async def run(csv_path_str: str) -> None:
-    csv_path = Path(csv_path_str)
-    df = _load_csv(csv_path)
-
-    engine = get_engine()  # <- get a real AsyncEngine (not a callable)
-    payload = (
-        {
-            "timestamp": pd.to_datetime(ts, utc=True).to_pydatetime(),
-            "price": float(price),
-            "card_key": str(card),
-        }
-        for ts, price, card in df.itertuples(index=False, name=None)
+async def ingest_csv(
+    csv_path: Path,
+    *,
+    source: str = "demo_csv",
+    override_card_key: Optional[str] = None,
+    currency_default: str = "USD",
+) -> int:
+    """
+    Public entrypoint: read CSV and insert into trades.
+    """
+    engine = create_async_engine(settings.database_url, future=True)  # type: ignore[attr-defined]
+    rows = _load_csv_rows(
+        csv_path,
+        source,
+        override_card_key=override_card_key,
+        currency_default=currency_default,
     )
-
-    inserted = await _bulk_insert(engine, payload)
-    print(f"Inserted ~{inserted} rows from {csv_path.name}")
+    return await _bulk_insert(engine, rows)
 
 
-def main() -> None:
+# Optional CLI:
+#   uv run python -m pkmn_factors.ingest.csv_to_trades \
+#       --csv data/trades_demo.csv --source demo_csv --card-key mew-ex-053-svp-2023 --currency USD
+if __name__ == "__main__":
     import argparse
+    import asyncio
 
-    ap = argparse.ArgumentParser(description="Load a CSV of trades into the DB.")
-    ap.add_argument(
-        "--csv",
-        required=True,
-        help="Path to CSV with columns: timestamp|ts, price, card_key",
-    )
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", type=Path, default=Path("data/trades_demo.csv"))
+    ap.add_argument("--source", type=str, default="demo_csv")
+    ap.add_argument("--card-key", type=str, default=None)
+    ap.add_argument("--currency", type=str, default="USD")
     args = ap.parse_args()
 
-    asyncio.run(run(args.csv))
-
-
-if __name__ == "__main__":
-    main()
+    asyncio.run(
+        ingest_csv(
+            args.csv,
+            source=args.source,
+            override_card_key=args.card_key,
+            currency_default=args.currency,
+        )
+    )
