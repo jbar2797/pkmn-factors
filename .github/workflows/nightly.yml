@@ -1,0 +1,57 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # 06:00 UTC daily
+  workflow_dispatch: {}
+
+jobs:
+  run-nightly:
+    runs-on: ubuntu-latest
+
+    services:
+      timescaledb:
+        image: timescale/timescaledb:latest-pg15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: pkmn
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pipx install uv
+
+      - name: Install deps
+        run: |
+          uv pip install --system -e .
+
+      - name: Create schema & apply alembic
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/pkmn
+        run: |
+          PYTHONPATH=src alembic upgrade head
+
+      - name: Run nightly backtests
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/pkmn
+        run: |
+          uv run python -m pkmn_factors.ops.run_nightly \
+            --universe data/universe_demo.csv \
+            --model-version bhs_baseline_v2 \
+            --horizon-days 90 \
+            --persist \
+            --refresh-cagg \
+            --max-concurrency 5
