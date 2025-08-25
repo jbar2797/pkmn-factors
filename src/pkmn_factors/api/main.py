@@ -6,11 +6,11 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from pkmn_factors.api.universe import router as universe_router
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from pkmn_factors.api.universe import router as universe_router
 from pkmn_factors.config import settings  # type: ignore[attr-defined]
 from pkmn_factors.eval.backtest import run as run_backtest
 from pkmn_factors.ingest.csv_to_trades import ingest_csv
