@@ -5,6 +5,7 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
+from pkmn_factors.api.universe import router as universe_router
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -102,3 +103,6 @@ async def universe(path: str = "data/universe_demo.csv") -> list[str]:
 STATIC_DIR = Path(__file__).parent / "static"
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/ui", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
+
+
+app.include_router(universe_router)
